@@ -2,7 +2,7 @@
 UR5 Forward and Inverse Kinematics Validator
 
 This script validates both FK and IK for the UR5 robot:
-- FK Validation: Connects to Unity TCP server and validates forward kinematics
+- FK Validation: Connects to Unity TCP server and validates forward kinematics (position and rotation)
 - IK Validation: Tests inverse kinematics solutions and round-trip accuracy
 - IK Server Testing: Tests the Python IK server if running
 
@@ -26,6 +26,7 @@ class UR5FKValidator:
         host='localhost',
         port=5005,
         tolerance=0.01,
+        rotation_tolerance=0.05,
         coordinate_mode='unity_to_ros'
     ):
         """
@@ -35,6 +36,7 @@ class UR5FKValidator:
             host (str): TCP server host
             port (int): TCP server port
             tolerance (float): Maximum allowable position error in meters
+            rotation_tolerance (float): Maximum allowable rotation error in radians
             coordinate_mode (str): Coordinate transformation mode:
                 - 'none': No transformation
                 - 'unity_to_ros': Unity (Y-up) to ROS (Z-up)
@@ -42,6 +44,7 @@ class UR5FKValidator:
         self.host = host
         self.port = port
         self.tolerance = tolerance
+        self.rotation_tolerance = rotation_tolerance
         self.coordinate_mode = coordinate_mode
         self.socket = None
 
@@ -79,6 +82,47 @@ class UR5FKValidator:
         else:
             return unity_pos
 
+    def transform_quaternion(self, unity_quat, mode):
+        """
+        Transform quaternion between Unity and robotics conventions.
+
+        Unity:     X-right, Y-up, Z-forward (left-handed)
+        Standard robotics (ROS/RTB): X-forward, Y-left, Z-up (right-handed)
+
+        Args:
+            unity_quat: Quaternion in Unity coordinates [x, y, z, w]
+            mode: Transformation mode string
+
+        Returns:
+            Transformed quaternion [x, y, z, w]
+        """
+        if mode == 'none':
+            return unity_quat
+        elif mode == 'unity_to_ros':
+            # Unity to ROS coordinate transformation for quaternions
+            # Unity: X-right, Y-up, Z-forward
+            # ROS:   X-forward, Y-left, Z-up
+            # Mapping: ROS_X = Unity_Z, ROS_Y = -Unity_X, ROS_Z = Unity_Y
+
+            # Convert Unity quaternion to ROS quaternion
+            # The transformation is: q_ros = q_transform * q_unity
+            # Where q_transform represents the coordinate system change
+
+            x, y, z, w = unity_quat
+
+            # Apply coordinate transformation to quaternion
+            # ROS quaternion components based on Unity to ROS mapping
+            ros_quat = np.array([
+                w,
+                -z,
+                x,
+                w
+            ])
+
+            return ros_quat
+        else:
+            return unity_quat
+
     def connect(self):
         """Establish TCP connection to the server"""
         try:
@@ -100,35 +144,37 @@ class UR5FKValidator:
         """
         Receive data from TCP server in binary format.
 
-        Binary format (72 bytes total):
-            9 doubles: [ee_x, ee_y, ee_z, j1, j2, j3, j4, j5, j6]
+        Binary format (104 bytes total):
+            13 doubles: [ee_x, ee_y, ee_z, quat_x, quat_y, quat_z, quat_w, j1, j2, j3, j4, j5, j6]
             All values are float64 (double precision, little-endian)
 
         Returns:
-            tuple: (end_effector_position, joint_angles) as numpy arrays, or (None, None) if error
+            tuple: (end_effector_position, end_effector_rotation, joint_angles) as numpy arrays, or (None, None, None) if error
         """
         try:
-            # Binary protocol: 9 doubles (72 bytes)
-            # Format: ee_x, ee_y, ee_z, j1, j2, j3, j4, j5, j6
-            data = self.socket.recv(72)
-            if len(data) != 72:
-                print(f"Expected 72 bytes, got {len(data)}")
-                return None, None
+            # Binary protocol: 13 doubles (104 bytes)
+            # Format: ee_x, ee_y, ee_z, quat_x, quat_y, quat_z, quat_w, j1, j2,
+            # j3, j4, j5, j6
+            data = self.socket.recv(104)
+            if len(data) != 104:
+                print(f"Expected 104 bytes, got {len(data)}")
+                return None, None, None
 
-            # Unpack 9 doubles (little-endian)
-            values = struct.unpack('<9d', data)
+            # Unpack 13 doubles (little-endian)
+            values = struct.unpack('<13d', data)
 
-            end_effector = np.array(values[:3])
-            joint_angles = np.array(values[3:])
+            end_effector_pos = np.array(values[:3])
+            end_effector_quat = np.array(values[3:7])  # [x, y, z, w]
+            joint_angles = np.array(values[7:])
 
-            return end_effector, joint_angles
+            return end_effector_pos, end_effector_quat, joint_angles
 
         except struct.error as e:
             print(f"Binary unpacking error: {e}")
-            return None, None
+            return None, None, None
         except Exception as e:
             print(f"Error receiving data: {e}")
-            return None, None
+            return None, None, None
 
     def calculate_forward_kinematics(self, joint_angles):
         """
@@ -138,7 +184,7 @@ class UR5FKValidator:
             joint_angles (np.ndarray): Array of 6 joint angles in radians
 
         Returns:
-            np.ndarray: End effector position [x, y, z]
+            tuple: (position, quaternion) where position is [x, y, z] and quaternion is [x, y, z, w]
         """
         # Calculate forward kinematics using built-in UR5 model
         T = self.ur5.fkine(joint_angles)
@@ -146,7 +192,14 @@ class UR5FKValidator:
         # Extract position (translation vector)
         position = T.t
 
-        return position
+        # Extract rotation as quaternion [x, y, z, w]
+        # Convert rotation matrix to unit quaternion
+        unit_quat = UnitQuaternion(T.R)
+        # Get quaternion in [x, y, z, w] format
+        quaternion = np.array(
+            [unit_quat.vec[0], unit_quat.vec[1], unit_quat.vec[2], unit_quat.s])
+
+        return position, quaternion
 
     def calculate_inverse_kinematics(
             self,
@@ -224,21 +277,56 @@ class UR5FKValidator:
 
         return is_valid, error_magnitude, error
 
+    def validate_rotation(self, reported_quat, calculated_quat):
+        """
+        Validate that reported and calculated rotations match within tolerance.
+
+        Uses quaternion distance metric to compute angular difference.
+
+        Args:
+            reported_quat (np.ndarray): Reported quaternion [x, y, z, w]
+            calculated_quat (np.ndarray): Calculated quaternion [x, y, z, w]
+
+        Returns:
+            tuple: (bool: is_valid, float: angular_error_rad)
+        """
+        # Normalize quaternions
+        q1 = reported_quat / np.linalg.norm(reported_quat)
+        q2 = calculated_quat / np.linalg.norm(calculated_quat)
+
+        # Calculate quaternion dot product (cosine of half the angle between
+        # them)
+        dot_product = np.abs(np.dot(q1, q2))
+
+        # Clamp to [-1, 1] to avoid numerical errors in arccos
+        dot_product = np.clip(dot_product, -1.0, 1.0)
+
+        # Angular error = 2 * arccos(|q1 · q2|)
+        angular_error = 2.0 * np.arccos(dot_product)
+
+        # Check if within tolerance
+        is_valid = angular_error <= self.rotation_tolerance
+
+        return is_valid, angular_error
+
     def run_continuous_validation(self):
-        """Continuously receive data and validate forward kinematics"""
+        """Continuously receive data and validate forward kinematics (position and rotation)"""
         if not self.connect():
             return
 
         print(
-            f"\nValidating forward kinematics (BINARY protocol, tolerance: {self.tolerance}m)")
+            f"\nValidating forward kinematics (BINARY protocol)")
+        print(f"Position tolerance: {self.tolerance}m")
+        print(
+            f"Rotation tolerance: {self.rotation_tolerance} rad ({np.degrees(self.rotation_tolerance):.2f}°)")
         print(f"Coordinate mode: {self.coordinate_mode}")
-        print("-" * 70)
+        print("-" * 80)
 
         try:
             iteration = 0
             while True:
-                reported_ee, joint_angles = self.receive_data()
-                if reported_ee is None or joint_angles is None:
+                reported_ee_pos, reported_ee_quat, joint_angles = self.receive_data()
+                if reported_ee_pos is None or reported_ee_quat is None or joint_angles is None:
                     print("No data received. Ending.")
                     break
 
@@ -249,33 +337,58 @@ class UR5FKValidator:
                     continue
 
                 # Calculate forward kinematics
-                calculated_ee = self.calculate_forward_kinematics(joint_angles)
+                calculated_ee_pos, calculated_ee_quat = self.calculate_forward_kinematics(
+                    joint_angles)
 
-                # Single mode validation
-                transformed_ee = self.transform_coordinates(
-                    reported_ee, self.coordinate_mode)
-                is_valid, error_mag, error_vector = self.validate(
-                    transformed_ee, calculated_ee)
+                # Transform position and rotation coordinates
+                transformed_ee_pos = self.transform_coordinates(
+                    reported_ee_pos, self.coordinate_mode)
+                transformed_ee_quat = self.transform_quaternion(
+                    reported_ee_quat, self.coordinate_mode)
+
+                # Validate position
+                pos_valid, pos_error_mag, pos_error_vector = self.validate(
+                    transformed_ee_pos, calculated_ee_pos)
+
+                # Validate rotation
+                rot_valid, rot_error = self.validate_rotation(
+                    transformed_ee_quat, calculated_ee_quat)
+
+                # Overall validity
+                overall_valid = pos_valid and rot_valid
 
                 # Print results
                 print(f"\nIteration {iteration}:")
                 print(
                     f"Joint Angles (rad): {[f'{j:.4f}' for j in joint_angles]}")
+                print(f"\nPosition Validation:")
                 print(
-                    f"Unity EE:       [{reported_ee[0]:.6f}, {reported_ee[1]:.6f}, {reported_ee[2]:.6f}]")
+                    f"  Unity EE:       [{reported_ee_pos[0]:.6f}, {reported_ee_pos[1]:.6f}, {reported_ee_pos[2]:.6f}]")
                 print(
-                    f"Transformed EE: [{transformed_ee[0]:.6f}, {transformed_ee[1]:.6f}, {transformed_ee[2]:.6f}]")
+                    f"  Transformed EE: [{transformed_ee_pos[0]:.6f}, {transformed_ee_pos[1]:.6f}, {transformed_ee_pos[2]:.6f}]")
                 print(
-                    f"Calculated EE:  [{calculated_ee[0]:.6f}, {calculated_ee[1]:.6f}, {calculated_ee[2]:.6f}]")
+                    f"  Calculated EE:  [{calculated_ee_pos[0]:.6f}, {calculated_ee_pos[1]:.6f}, {calculated_ee_pos[2]:.6f}]")
                 print(
-                    f"Error vector:   [{error_vector[0]:.6f}, {error_vector[1]:.6f}, {error_vector[2]:.6f}]")
-                print(f"Error magnitude: {error_mag:.6f}m")
+                    f"  Error vector:   [{pos_error_vector[0]:.6f}, {pos_error_vector[1]:.6f}, {pos_error_vector[2]:.6f}]")
+                print(f"  Error magnitude: {pos_error_mag:.6f}m")
                 print(
-                    f"Status: {'✓ VALID' if is_valid else '✗ INVALID (exceeds tolerance)'}")
-                print("-" * 70)
+                    f"  Status: {'✓ VALID' if pos_valid else '✗ INVALID (exceeds tolerance)'}")
 
-                calculated_angles = self.calculate_inverse_kinematics(
-                    transformed_ee)
+                print(f"\nRotation Validation:")
+                print(
+                    f"  Unity Quat:       [{reported_ee_quat[0]:.6f}, {reported_ee_quat[1]:.6f}, {reported_ee_quat[2]:.6f}, {reported_ee_quat[3]:.6f}]")
+                print(
+                    f"  Transformed Quat: [{transformed_ee_quat[0]:.6f}, {transformed_ee_quat[1]:.6f}, {transformed_ee_quat[2]:.6f}, {transformed_ee_quat[3]:.6f}]")
+                print(
+                    f"  Calculated Quat:  [{calculated_ee_quat[0]:.6f}, {calculated_ee_quat[1]:.6f}, {calculated_ee_quat[2]:.6f}, {calculated_ee_quat[3]:.6f}]")
+                print(
+                    f"  Angular error: {rot_error:.6f} rad ({np.degrees(rot_error):.2f}°)")
+                print(
+                    f"  Status: {'✓ VALID' if rot_valid else '✗ INVALID (exceeds tolerance)'}")
+
+                print(
+                    f"\nOverall: {'✓ VALID' if overall_valid else '✗ INVALID'}")
+                print("-" * 80)
 
         except KeyboardInterrupt:
             print("\n\nValidation stopped by user")
@@ -293,12 +406,13 @@ class UR5FKValidator:
         end_effector = np.asarray(end_effector)
         joint_angles = np.asarray(joint_angles)
 
-        calculated_ee = self.calculate_forward_kinematics(joint_angles)
+        calculated_ee_pos, calculated_ee_quat = self.calculate_forward_kinematics(
+            joint_angles)
         is_valid, error_mag, error_vector = self.validate(
-            end_effector, calculated_ee)
+            end_effector, calculated_ee_pos)
 
         print(f"Reported EE:    {end_effector}")
-        print(f"Calculated EE:  {calculated_ee}")
+        print(f"Calculated EE:  {calculated_ee_pos}")
         print(f"Error vector:   {error_vector}")
         print(f"Error magnitude: {error_mag:.6f}m")
         print(f"Status: {'✓ VALID' if is_valid else '✗ INVALID'}")
@@ -325,6 +439,11 @@ def main():
         type=float,
         default=0.01,
         help='Position error tolerance in meters (default: 0.01)')
+    parser.add_argument(
+        '--rotation-tolerance',
+        type=float,
+        default=0.05,
+        help='Rotation error tolerance in radians (default: 0.05, ~2.87 degrees)')
 
     args = parser.parse_args()
 
@@ -332,7 +451,8 @@ def main():
     validator = UR5FKValidator(
         host=args.host,
         port=args.port,
-        tolerance=args.tolerance
+        tolerance=args.tolerance,
+        rotation_tolerance=args.rotation_tolerance
     )
 
     validator.run_continuous_validation()
