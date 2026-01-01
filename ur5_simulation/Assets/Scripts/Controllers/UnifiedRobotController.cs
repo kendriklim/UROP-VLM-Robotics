@@ -21,11 +21,21 @@ public class UnifiedRobotController : MonoBehaviour
     public CSVTrajectoryController csvTrajectoryController;
     [HideInInspector]
     public SuctionController suctionController;
+    [HideInInspector]
+    public UR5IKSolver ikSolver;
 
     [Header("Control Settings")]
     public ControlMode currentMode = ControlMode.Start;
     public float jointSpeed = JointSpeed; // degrees per second
     public float moveSpeed = 5.0f;
+
+    [Header("IK Control Settings")]
+    [Tooltip("Movement step size in meters for IK control")]
+    public float ikStepSize = 0.01f; // 1cm per key press
+    [Tooltip("Rotation step size in degrees for IK control")]
+    public float ikRotationStep = 5.0f; // 5 degrees per key press
+    [Tooltip("Smooth movement duration for IK control")]
+    public float ikSmoothDuration = 0.2f;
 
     public enum ControlMode
     {
@@ -40,6 +50,12 @@ public class UnifiedRobotController : MonoBehaviour
     private ArticulationBody[] articulationChain;
     private ArticulationBody[] robotJoints;
     private Transform endEffector;
+
+    // IK control state
+    private Vector3 ikTargetPosition;
+    private Quaternion ikTargetRotation;
+    private bool ikInitialized = false;
+    private bool ikMovementInProgress = false;
 
     /// <summary>
     /// Public access to robot joints for debugging
@@ -72,6 +88,9 @@ public class UnifiedRobotController : MonoBehaviour
 
         if (suctionController == null)
             suctionController = GetComponent<SuctionController>();
+
+        if (ikSolver == null)
+            ikSolver = GetComponent<UR5IKSolver>();
 
         // Get joints from robotArmSetup
         if (robotArmSetup != null && robotArmSetup.articulationChain != null)
@@ -175,86 +194,188 @@ public class UnifiedRobotController : MonoBehaviour
 
     void HandleIKControl()
     {
-        // Simple velocity-based joint control (bypasses IK solver)
-        // Maps WASDQE to coordinated joint movements for intuitive control
-
-        if (robotJoints == null || robotJoints.Length < 6 || endEffector == null)
+        // Initialize IK target to current end-effector pose on first entry to IK mode
+        if (!ikInitialized || endEffector == null)
+        {
+            if (endEffector != null)
+            {
+                ikTargetPosition = endEffector.position;
+                ikTargetRotation = endEffector.rotation;
+                ikInitialized = true;
+                Debug.Log($"IK Control initialized at position: {ikTargetPosition}");
+            }
             return;
+        }
 
-        float rotationSpeed = 30f; // degrees per second
-        float delta = rotationSpeed * Time.deltaTime;
+        // Check if IK solver is available
+        if (ikSolver == null)
+        {
+            Debug.LogError("UR5IKSolver component not found! Add UR5IKSolver to this GameObject.");
+            return;
+        }
 
-        // Track input to calculate desired target
-        Vector3 movement = Vector3.zero;
-        string keyPressed = "";
-        bool inputDetected = false;
+        // Skip input if movement is in progress
+        if (ikMovementInProgress)
+        {
+            return;
+        }
 
-        // W/S: Base rotation (left/right)
+        // Handle keyboard input for end-effector movement
+        bool movementRequested = false;
+        Vector3 deltaPosition = Vector3.zero;
+        Vector3 deltaRotation = Vector3.zero; // Euler angles in degrees
+
+        // Translation controls (WASDQE)
         if (Input.GetKey(KeyCode.W))
         {
-            AdjustJoint(0, -delta);
-            movement += Vector3.forward * moveSpeed * Time.deltaTime;
-            keyPressed = "W";
-            inputDetected = true;
+            deltaPosition.z += ikStepSize; // Forward
+            movementRequested = true;
         }
         if (Input.GetKey(KeyCode.S))
         {
-            AdjustJoint(0, delta);
-            movement += Vector3.back * moveSpeed * Time.deltaTime;
-            keyPressed = "S";
-            inputDetected = true;
+            deltaPosition.z -= ikStepSize; // Backward
+            movementRequested = true;
         }
-
-        // A/D: Shoulder + Elbow (forward/back reach)
         if (Input.GetKey(KeyCode.A))
         {
-            AdjustJoint(1, delta);
-            AdjustJoint(2, -delta);
-            movement += Vector3.left * moveSpeed * Time.deltaTime;
-            keyPressed = "A";
-            inputDetected = true;
+            deltaPosition.x -= ikStepSize; // Left
+            movementRequested = true;
         }
         if (Input.GetKey(KeyCode.D))
         {
-            AdjustJoint(1, -delta);
-            AdjustJoint(2, delta);
-            movement += Vector3.right * moveSpeed * Time.deltaTime;
-            keyPressed = "D";
-            inputDetected = true;
+            deltaPosition.x += ikStepSize; // Right
+            movementRequested = true;
         }
-
-        // Q/E: Vertical movement (up/down)
         if (Input.GetKey(KeyCode.Q))
         {
-            AdjustJoint(1, delta);
-            AdjustJoint(2, delta);
-            movement += Vector3.up * moveSpeed * Time.deltaTime;
-            keyPressed = "Q";
-            inputDetected = true;
+            deltaPosition.y += ikStepSize; // Up
+            movementRequested = true;
         }
         if (Input.GetKey(KeyCode.E))
         {
-            AdjustJoint(1, -delta);
-            AdjustJoint(2, -delta);
-            movement += Vector3.down * moveSpeed * Time.deltaTime;
-            keyPressed = "E";
-            inputDetected = true;
+            deltaPosition.y -= ikStepSize; // Down
+            movementRequested = true;
+        }
 
+        // Rotation controls (Arrow keys + Page Up/Down)
+        if (Input.GetKey(KeyCode.UpArrow))
+        {
+            deltaRotation.x += ikRotationStep; // Pitch up
+            movementRequested = true;
+        }
+        if (Input.GetKey(KeyCode.DownArrow))
+        {
+            deltaRotation.x -= ikRotationStep; // Pitch down
+            movementRequested = true;
+        }
+        if (Input.GetKey(KeyCode.LeftArrow))
+        {
+            deltaRotation.y -= ikRotationStep; // Yaw left
+            movementRequested = true;
+        }
+        if (Input.GetKey(KeyCode.RightArrow))
+        {
+            deltaRotation.y += ikRotationStep; // Yaw right
+            movementRequested = true;
+        }
+        if (Input.GetKey(KeyCode.PageUp))
+        {
+            deltaRotation.z += ikRotationStep; // Roll CCW
+            movementRequested = true;
+        }
+        if (Input.GetKey(KeyCode.PageDown))
+        {
+            deltaRotation.z -= ikRotationStep; // Roll CW
+            movementRequested = true;
+        }
 
-            // Debug output comparing desired vs actual position
-            if (inputDetected)
+        // Reset to current position
+        if (Input.GetKeyDown(KeyCode.R))
+        {
+            ikTargetPosition = endEffector.position;
+            ikTargetRotation = endEffector.rotation;
+            Debug.Log("IK target reset to current end-effector pose");
+            return;
+        }
+
+        // If movement was requested, solve IK and move robot
+        if (movementRequested)
+        {
+            // Update target pose
+            ikTargetPosition += deltaPosition;
+            ikTargetRotation *= Quaternion.Euler(deltaRotation);
+
+            // Get current joint angles
+            float[] currentAngles = new float[6];
+            for (int i = 0; i < 6 && i < robotJoints.Length; i++)
             {
-                Vector3 currentPos = endEffector.position;
-                Vector3 desiredTarget = currentPos + movement;
-
-                // Wait one frame to see actual position after joint adjustment
-                StartCoroutine(ComparePositions(keyPressed, currentPos, desiredTarget));
+                currentAngles[i] = robotJoints[i].jointPosition[0]; // Already in radians
             }
 
-            // Reset with R
-            if (Input.GetKeyDown(KeyCode.R))
-                ResetToHomePosition();
+            // Solve IK for target pose
+            float[] solution = ikSolver.SolveIK(ikTargetPosition, ikTargetRotation, currentAngles);
+
+            if (solution != null && solution.Length == 6)
+            {
+                // Convert radians to degrees and apply solution
+                float[] solutionDegrees = new float[6];
+                for (int i = 0; i < 6; i++)
+                {
+                    solutionDegrees[i] = solution[i] * Mathf.Rad2Deg;
+                }
+
+                // Start smooth movement to target
+                StartCoroutine(MoveToJointAnglesSmooth(solutionDegrees));
+
+                if (ikSolver.debugMode)
+                {
+                    Debug.Log($"IK target: pos={ikTargetPosition}, rot={ikTargetRotation.eulerAngles}");
+                }
+            }
+            else
+            {
+                // IK failed - revert target to current position
+                Debug.LogWarning("IK solution failed - target pose may be unreachable");
+                ikTargetPosition -= deltaPosition;
+                ikTargetRotation *= Quaternion.Euler(-deltaRotation);
+            }
         }
+    }
+
+    /// <summary>
+    /// Smoothly move robot to target joint angles over time
+    /// </summary>
+    private IEnumerator MoveToJointAnglesSmooth(float[] targetAngles)
+    {
+        ikMovementInProgress = true;
+
+        float[] startAngles = new float[6];
+        for (int i = 0; i < 6 && i < robotJoints.Length; i++)
+        {
+            startAngles[i] = robotJoints[i].jointPosition[0] * Mathf.Rad2Deg;
+        }
+
+        float elapsed = 0f;
+
+        while (elapsed < ikSmoothDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / ikSmoothDuration);
+            t = Mathf.SmoothStep(0f, 1f, t); // Smooth interpolation
+
+            float[] currentAngles = new float[6];
+            for (int i = 0; i < 6; i++)
+            {
+                currentAngles[i] = Mathf.LerpAngle(startAngles[i], targetAngles[i], t);
+            }
+
+            SetJointAngles(currentAngles);
+            yield return null;
+        }
+
+        // Ensure final position
+        SetJointAngles(targetAngles);
+        ikMovementInProgress = false;
     }
 
     private System.Collections.IEnumerator ComparePositions(string key, Vector3 startPos, Vector3 desiredTarget)
@@ -328,6 +449,13 @@ public class UnifiedRobotController : MonoBehaviour
     {
         currentMode = mode;
         Debug.Log($"Switched to {mode} control mode");
+
+        // Reset IK state when entering IK mode
+        if (mode == ControlMode.IK)
+        {
+            ikInitialized = false;
+            ikMovementInProgress = false;
+        }
 
         // Enable/disable appropriate components
         if (manualController != null)
@@ -634,7 +762,7 @@ public class UnifiedRobotController : MonoBehaviour
                 instructionText = "Left/Right: Select joint | Up/Down: Move joint | R: Reset";
                 break;
             case ControlMode.IK:
-                instructionText = "WASDQE: Move end effector | R: Reset";
+                instructionText = "WASDQE: Move XYZ | Arrows: Rotate | PgUp/PgDn: Roll | R: Reset";
                 break;
             case ControlMode.PickAndPlace:
                 instructionText = "S: Start pick and place operation";
