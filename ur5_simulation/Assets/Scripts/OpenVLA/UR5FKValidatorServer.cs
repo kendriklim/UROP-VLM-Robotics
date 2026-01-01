@@ -8,7 +8,7 @@ using UnityEngine;
 /// TCP server that broadcasts UR5 robot state (end effector position and joint angles)
 /// to connected clients in binary format for forward kinematics validation.
 ///
-/// Binary protocol: 9 doubles (72 bytes) - [ee_x, ee_y, ee_z, j1, j2, j3, j4, j5, j6]
+/// Binary protocol: 13 doubles (104 bytes) - [ee_x, ee_y, ee_z, quat_x, quat_y, quat_z, quat_w, j1, j2, j3, j4, j5, j6]
 /// Uses async I/O on main thread - no state caching or background threads needed.
 /// </summary>
 public class UR5FKValidatorServer : MonoBehaviour
@@ -153,7 +153,7 @@ public class UR5FKValidatorServer : MonoBehaviour
     /// </summary>
     double[] GetRobotState()
     {
-        double[] state = new double[9];
+        double[] state = new double[13];
 
         // Get end effector pose
         var (position, rotation) = ur5controller.GetEndEffectorPose();
@@ -167,45 +167,44 @@ public class UR5FKValidatorServer : MonoBehaviour
             return state;
         }
 
-        // this is Unity to ROS conversion 
-        // // End effector position
-        // // Unity uses y as up and down, but convention is z as up and down
-        // double[] conventionalPosition = { position.x, position.z, position.y };
-        // // rtb coordinates are rotated by 90deg?
-        // state[0] = conventionalPosition[1];
-        // state[1] = -conventionalPosition[0];
-        // state[2] = conventionalPosition[2];
-
+        // unity to ROS coordinate system conversion is handled in python
+        // position
         state[0] = position.x;
         state[1] = position.y;
         state[2] = position.z;
 
+        // End effector rotation (quaternion: x, y, z, w)
+        state[3] = rotation.x;
+        state[4] = rotation.y;
+        state[5] = rotation.z;
+        state[6] = rotation.w;
+
         // Joint angles (radians)
         for (int i = 0; i < 6; i++)
         {
-            state[3 + i] = jointAngles[i];
+            state[7 + i] = jointAngles[i];
         }
 
         return state;
     }
 
     /// <summary>
-    /// Send robot state in binary format (72 bytes) asynchronously
-    /// Format: 9 doubles (little-endian) - [ee_x, ee_y, ee_z, j1, j2, j3, j4, j5, j6]
+    /// Send robot state in binary format (104 bytes) asynchronously
+    /// Format: 13 doubles (little-endian) - [ee_x, ee_y, ee_z, quat_x, quat_y, quat_z, quat_w, j1, j2, j3, j4, j5, j6]
     /// </summary>
     async Task SendBinaryStateAsync(NetworkStream stream, double[] state)
     {
-        // Pack 9 doubles into 72 bytes (little-endian)
-        byte[] buffer = new byte[72];
+        // Pack 13 doubles into 104 bytes (little-endian)
+        byte[] buffer = new byte[104];
 
-        for (int i = 0; i < 9; i++)
+        for (int i = 0; i < 13; i++)
         {
             byte[] doubleBytes = BitConverter.GetBytes(state[i]);
             Array.Copy(doubleBytes, 0, buffer, i * 8, 8);
         }
 
         // Send binary data asynchronously
-        await stream.WriteAsync(buffer, 0, 72);
+        await stream.WriteAsync(buffer, 0, 104);
         await stream.FlushAsync();
     }
 
