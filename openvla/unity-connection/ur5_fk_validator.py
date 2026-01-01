@@ -3,10 +3,11 @@ UR5 Forward and Inverse Kinematics Validator
 
 This script validates both FK and IK for the UR5 robot:
 - FK Validation: Connects to Unity TCP server and validates forward kinematics (position and rotation)
-- IK Validation: Tests inverse kinematics solutions and round-trip accuracy
-- IK Server Testing: Tests the Python IK server if running
+- IK Validation: Tests inverse kinematics round-trip accuracy (joint angles → FK → pose → IK → joint angles)
+- Coordinate Transformation: Handles Unity to ROS coordinate system conversion
 
 Binary protocol is much faster than JSON (no parsing overhead, smaller data size).
+Protocol: 13 doubles (104 bytes) - [ee_x, ee_y, ee_z, quat_x, quat_y, quat_z, quat_w, j1, j2, j3, j4, j5, j6]
 """
 
 import socket
@@ -15,7 +16,6 @@ import numpy as np
 import roboticstoolbox as rtb
 from spatialmath import SE3, UnitQuaternion
 import os
-import time
 
 
 class UR5FKValidator:
@@ -27,6 +27,7 @@ class UR5FKValidator:
         port=5005,
         tolerance=0.01,
         rotation_tolerance=0.05,
+        joint_tolerance=0.01,
         coordinate_mode='unity_to_ros'
     ):
         """
@@ -37,6 +38,7 @@ class UR5FKValidator:
             port (int): TCP server port
             tolerance (float): Maximum allowable position error in meters
             rotation_tolerance (float): Maximum allowable rotation error in radians
+            joint_tolerance (float): Maximum allowable joint angle error in radians
             coordinate_mode (str): Coordinate transformation mode:
                 - 'none': No transformation
                 - 'unity_to_ros': Unity (Y-up) to ROS (Z-up)
@@ -45,6 +47,7 @@ class UR5FKValidator:
         self.port = port
         self.tolerance = tolerance
         self.rotation_tolerance = rotation_tolerance
+        self.joint_tolerance = joint_tolerance
         self.coordinate_mode = coordinate_mode
         self.socket = None
 
@@ -113,9 +116,9 @@ class UR5FKValidator:
             # Apply coordinate transformation to quaternion
             # ROS quaternion components based on Unity to ROS mapping
             ros_quat = np.array([
-                w,
                 -z,
                 x,
+                -y,
                 w
             ])
 
@@ -195,9 +198,15 @@ class UR5FKValidator:
         # Extract rotation as quaternion [x, y, z, w]
         # Convert rotation matrix to unit quaternion
         unit_quat = UnitQuaternion(T.R)
-        # Get quaternion in [x, y, z, w] format
-        quaternion = np.array(
-            [unit_quat.vec[0], unit_quat.vec[1], unit_quat.vec[2], unit_quat.s])
+
+        # Debug: Check what we're getting
+        # .vec returns [w, x, y, z], .v returns [x, y, z], .s returns w
+        # We want to output [x, y, z, w]
+        quat_v = unit_quat.v  # Vector part [x, y, z]
+        quat_s = unit_quat.s  # Scalar part w
+
+        # Construct [x, y, z, w]
+        quaternion = np.concatenate([quat_v, [quat_s]])
 
         return position, quaternion
 
@@ -224,6 +233,7 @@ class UR5FKValidator:
                 T_target = SE3.Trans(target_position)
             elif isinstance(target_rotation, UnitQuaternion):
                 T_target = SE3.Rt(target_rotation.R, target_position)
+                print(f"target transform is: {T_target}")
             else:
                 # Assume it's a rotation matrix
                 T_target = SE3.Rt(target_rotation, target_position)
@@ -233,7 +243,7 @@ class UR5FKValidator:
                 q0 = np.zeros(6)
 
             # Solve IK using Levenberg-Marquardt
-            result = self.ur5.ik_LM(T_target, q0=q0, tol=1e-6)
+            result = self.ur5.ik_LM(T_target)
 
             # Handle different return types from roboticstoolbox versions
             if isinstance(result, tuple):
@@ -309,16 +319,49 @@ class UR5FKValidator:
 
         return is_valid, angular_error
 
+    def validate_joint_angles(self, original_angles, calculated_angles):
+        """
+        Validate that original and calculated joint angles match within tolerance.
+
+        Args:
+            original_angles (np.ndarray): Original joint angles in radians
+            calculated_angles (np.ndarray): Calculated joint angles from IK in radians
+
+        Returns:
+            tuple: (bool: is_valid, float: max_error_rad, np.ndarray: error_vector)
+        """
+        # Calculate error for each joint
+        error = calculated_angles - original_angles
+
+        # Normalize angles to [-pi, pi] for proper error calculation
+        error = np.arctan2(np.sin(error), np.cos(error))
+
+        # Find maximum error
+        max_error = np.max(np.abs(error))
+
+        # Check if all joints within tolerance
+        is_valid = max_error <= self.joint_tolerance
+
+        return is_valid, max_error, error
+
     def run_continuous_validation(self):
-        """Continuously receive data and validate forward kinematics (position and rotation)"""
+        """
+        Continuously receive data and validate forward and inverse kinematics.
+
+        Tests:
+        1. Forward Kinematics: Joint angles → Position & Rotation
+        2. Inverse Kinematics: Position & Rotation → Joint angles (round-trip test)
+        """
         if not self.connect():
             return
 
         print(
-            f"\nValidating forward kinematics (BINARY protocol)")
+            f"\nValidating forward and inverse kinematics (BINARY protocol)")
         print(f"Position tolerance: {self.tolerance}m")
         print(
             f"Rotation tolerance: {self.rotation_tolerance} rad ({np.degrees(self.rotation_tolerance):.2f}°)")
+        print(
+            f"Joint angle tolerance: {self.joint_tolerance} rad ({np.degrees(self.joint_tolerance):.2f}°)")
         print(f"Coordinate mode: {self.coordinate_mode}")
         print("-" * 80)
 
@@ -354,14 +397,36 @@ class UR5FKValidator:
                 rot_valid, rot_error = self.validate_rotation(
                     transformed_ee_quat, calculated_ee_quat)
 
+                # Test inverse kinematics (round-trip test)
+                # Convert calculated quaternion to UnitQuaternion for IK
+                calc_unit_quat = UnitQuaternion(
+                    calculated_ee_quat[3], calculated_ee_quat[:3]
+                )
+                ik_success, ik_joint_angles, ik_iterations = self.calculate_inverse_kinematics(
+                    calculated_ee_pos,
+                    calc_unit_quat,
+                    q0=joint_angles  # Use current joint angles as initial guess
+                )
+                print(f"IK SUCCESS: {ik_success}")
+
+                # Validate IK solution
+                if ik_success and ik_joint_angles is not None:
+                    ik_valid, ik_max_error, ik_error_vector = self.validate_joint_angles(
+                        joint_angles, ik_joint_angles)
+                else:
+                    ik_valid = False
+                    ik_max_error = np.inf
+                    ik_error_vector = np.zeros(6)
+
                 # Overall validity
-                overall_valid = pos_valid and rot_valid
+                overall_valid = pos_valid and rot_valid and ik_valid
 
                 # Print results
                 print(f"\nIteration {iteration}:")
                 print(
-                    f"Joint Angles (rad): {[f'{j:.4f}' for j in joint_angles]}")
-                print(f"\nPosition Validation:")
+                    f"Original Joint Angles (rad): {[f'{j:.4f}' for j in joint_angles]}")
+
+                print(f"\nForward Kinematics - Position Validation:")
                 print(
                     f"  Unity EE:       [{reported_ee_pos[0]:.6f}, {reported_ee_pos[1]:.6f}, {reported_ee_pos[2]:.6f}]")
                 print(
@@ -374,7 +439,7 @@ class UR5FKValidator:
                 print(
                     f"  Status: {'✓ VALID' if pos_valid else '✗ INVALID (exceeds tolerance)'}")
 
-                print(f"\nRotation Validation:")
+                print(f"\nForward Kinematics - Rotation Validation:")
                 print(
                     f"  Unity Quat:       [{reported_ee_quat[0]:.6f}, {reported_ee_quat[1]:.6f}, {reported_ee_quat[2]:.6f}, {reported_ee_quat[3]:.6f}]")
                 print(
@@ -386,8 +451,22 @@ class UR5FKValidator:
                 print(
                     f"  Status: {'✓ VALID' if rot_valid else '✗ INVALID (exceeds tolerance)'}")
 
+                print(f"\nInverse Kinematics - Round-trip Validation:")
+                if ik_success:
+                    print(
+                        f"  IK Joint Angles (rad): {[f'{j:.4f}' for j in ik_joint_angles]}")
+                    print(
+                        f"  Joint Errors (rad):    {[f'{e:.6f}' for e in ik_error_vector]}")
+                    print(
+                        f"  Max joint error: {ik_max_error:.6f} rad ({np.degrees(ik_max_error):.2f}°)")
+                    print(f"  IK iterations: {ik_iterations}")
+                    print(
+                        f"  Status: {'✓ VALID' if ik_valid else '✗ INVALID (exceeds tolerance)'}")
+                else:
+                    print(f"  Status: ✗ IK FAILED TO CONVERGE")
+
                 print(
-                    f"\nOverall: {'✓ VALID' if overall_valid else '✗ INVALID'}")
+                    f"\nOverall: {'✓ ALL VALID' if overall_valid else '✗ VALIDATION FAILED'}")
                 print("-" * 80)
 
         except KeyboardInterrupt:
@@ -444,6 +523,11 @@ def main():
         type=float,
         default=0.05,
         help='Rotation error tolerance in radians (default: 0.05, ~2.87 degrees)')
+    parser.add_argument(
+        '--joint-tolerance',
+        type=float,
+        default=0.01,
+        help='Joint angle error tolerance in radians (default: 0.01, ~0.57 degrees)')
 
     args = parser.parse_args()
 
@@ -452,7 +536,8 @@ def main():
         host=args.host,
         port=args.port,
         tolerance=args.tolerance,
-        rotation_tolerance=args.rotation_tolerance
+        rotation_tolerance=args.rotation_tolerance,
+        joint_tolerance=args.joint_tolerance
     )
 
     validator.run_continuous_validation()
