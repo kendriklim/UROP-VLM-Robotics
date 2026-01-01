@@ -237,11 +237,10 @@ class UR5FKValidator:
         try:
             iteration = 0
             while True:
-                # Receive data
                 reported_ee, joint_angles = self.receive_data()
                 if reported_ee is None or joint_angles is None:
-                    print("No data received, retrying...")
-                    continue
+                    print("No data received. Ending.")
+                    break
 
                 iteration += 1
 
@@ -274,6 +273,9 @@ class UR5FKValidator:
                 print(
                     f"Status: {'✓ VALID' if is_valid else '✗ INVALID (exceeds tolerance)'}")
                 print("-" * 70)
+
+                calculated_angles = self.calculate_inverse_kinematics(
+                    transformed_ee)
 
         except KeyboardInterrupt:
             print("\n\nValidation stopped by user")
