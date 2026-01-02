@@ -7,7 +7,7 @@ using System.Collections;
 public class UR5Controller : MonoBehaviour
 {
     [Header("IK Settings")]
-    private float moveDuration = 1f;
+    public float moveDuration = 0.3f; // Faster for continuous movement
     public float stiffness = 10000f;
     public float damping = 100f;
 
@@ -23,6 +23,7 @@ public class UR5Controller : MonoBehaviour
     private Transform originTransform; // used to calculate the relative position of the end effector to the base of the robot
 
     private Coroutine moveCoroutine;
+    private bool isMoving = false;
 
     void Start()
     {
@@ -85,6 +86,12 @@ public class UR5Controller : MonoBehaviour
     /// </summary>
     public void MoveToTarget(Vector3 targetPosition, Quaternion targetRotation)
     {
+        // Don't start a new movement if one is already in progress
+        if (isMoving)
+        {
+            return;
+        }
+
         (Vector3 relativePosition, Quaternion relativeRotation) = ConvertToRobotCoordinates(targetPosition, targetRotation);
         float[] currentAngles = GetJointAngles();
         float[] targetAngles = ikSolver.SolveIK(relativePosition, relativeRotation, currentAngles);
@@ -98,6 +105,7 @@ public class UR5Controller : MonoBehaviour
             {
                 StopCoroutine(moveCoroutine);
             }
+            isMoving = true;
             moveCoroutine = StartCoroutine(MoveToAnglesCoroutine(targetAngles));
         }
         else
@@ -163,6 +171,7 @@ public class UR5Controller : MonoBehaviour
         }
 
         SetJointAngles(targetAngles);
+        isMoving = false;
     }
 
     private (Vector3 position, Quaternion rotation) ConvertToRobotCoordinates(Vector3 inputPosition, Quaternion inputRotation)

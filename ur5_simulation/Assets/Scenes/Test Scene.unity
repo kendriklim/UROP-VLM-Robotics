@@ -3122,7 +3122,7 @@ MonoBehaviour:
   suctionController: {fileID: 0}
   currentMode: 0
   jointSpeed: 15
-  moveSpeed: 50
+  moveSpeed: 500
   ikStepSize: 0.01
   ikRotationStep: 5
   ikSmoothDuration: 0.2

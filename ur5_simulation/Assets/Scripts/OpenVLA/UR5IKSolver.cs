@@ -29,7 +29,7 @@ public class UR5IKSolver : MonoBehaviour
 
     [SerializeField]
     [Tooltip("Connection timeout in milliseconds")]
-    private int connectionTimeout = 2000;
+    private int connectionTimeout = 5000; // Initial connection timeout (5 seconds)
 
     // [Header("Debug")]
     // [SerializeField]
@@ -72,8 +72,14 @@ public class UR5IKSolver : MonoBehaviour
             Debug.Log($"UR5IKSolver: Connecting to Python IK server at {serverHost}:{serverPort}...");
 
             client = new TcpClient();
-            client.ReceiveTimeout = connectionTimeout;
-            client.SendTimeout = connectionTimeout;
+
+            // Enable TCP keepalive to prevent idle disconnects
+            client.Client.SetSocketOption(System.Net.Sockets.SocketOptionLevel.Socket,
+                                         System.Net.Sockets.SocketOptionName.KeepAlive, true);
+
+            // Set 10-minute timeout to keep connection alive
+            client.ReceiveTimeout = 600000; // 10 minutes
+            client.SendTimeout = 600000; // 10 minutes
 
             IAsyncResult result = client.BeginConnect(serverHost, serverPort, null, null);
             bool success = result.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(connectionTimeout));
@@ -217,8 +223,8 @@ public class UR5IKSolver : MonoBehaviour
 
             writer.Flush();
 
-            // Wait for data to be available with timeout
-            int timeout = connectionTimeout;
+            // Wait for data to be available with 10-minute timeout
+            int timeout = 600000; // 10 minutes in milliseconds
             int elapsed = 0;
             int sleepInterval = 10; // ms
 

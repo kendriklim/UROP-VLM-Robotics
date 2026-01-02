@@ -153,9 +153,12 @@ class UR5IKServer:
         """
         print(f"Client connected from {address}")
 
-        # Set socket to blocking mode with timeout
+        # Enable TCP keepalive to prevent idle disconnects
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        # Set socket to blocking mode with 10-minute timeout
         client_socket.setblocking(True)
-        client_socket.settimeout(10.0)  # 10 second timeout
+        client_socket.settimeout(600.0)  # 10 minute timeout
 
         try:
             while True:

@@ -199,7 +199,7 @@ public class UnifiedRobotController : MonoBehaviour
         Vector3 deltaPosition = Vector3.zero;
         Vector3 deltaRotation = Vector3.zero; // Euler angles in degrees
 
-        // Translation controls (WASDQE)
+        // Translation controls (WASDQE) - hold for continuous movement
         if (Input.GetKey(KeyCode.W))
         {
             deltaPosition.z += ikStepSize; // Forward
@@ -222,16 +222,16 @@ public class UnifiedRobotController : MonoBehaviour
         }
         if (Input.GetKey(KeyCode.Q))
         {
-            deltaPosition.y += ikStepSize; // Up
+            deltaPosition.y -= ikStepSize; // Down
             movementRequested = true;
         }
         if (Input.GetKey(KeyCode.E))
         {
-            deltaPosition.y -= ikStepSize; // Down
+            deltaPosition.y += ikStepSize; // Up
             movementRequested = true;
         }
 
-        // Rotation controls (Arrow keys + Page Up/Down)
+        // Rotation controls (Arrow keys + Page Up/Down) - hold for continuous rotation
         if (Input.GetKey(KeyCode.UpArrow))
         {
             deltaRotation.x += ikRotationStep; // Pitch up
