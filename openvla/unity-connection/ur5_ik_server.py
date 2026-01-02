@@ -2,24 +2,18 @@
 UR5 Inverse Kinematics TCP Server
 
 This server provides IK solving capabilities for the UR5 robot using roboticstoolbox.
-It accepts TCP connections from Unity and solves IK for target poses or delta actions.
+It accepts TCP connections from Unity and solves IK for target poses.
 
 Protocol:
     Client sends:
-        - 1 byte: command type (1=SolveIK, 2=SolveIKDelta)
-        - Data depends on command type
+        - 104 bytes: [target_pos(3d)] + [target_rot(4d)] + [current_angles(6d)]
+        - target_pos: 3 doubles (24 bytes) - target position xyz
+        - target_rot: 4 doubles (32 bytes) - target quaternion xyzw
+        - current_angles: 6 doubles (48 bytes) - current joint angles in radians
 
     Server responds:
         - 1 byte: success flag (1=success, 0=failure)
         - 48 bytes: 6 joint angles as doubles (if success)
-
-Command 1 - SolveIK:
-    Request: [cmd(1)] + [target_pos(3d)] + [target_rot(4d)] + [current_angles(6d)]
-    Total: 1 + 24 + 32 + 48 = 105 bytes
-
-Command 2 - SolveIKDelta:
-    Request: [cmd(1)] + [current_pos(3d)] + [current_rot(4d)] + [delta(7d)] + [current_angles(6d)]
-    Total: 1 + 24 + 32 + 56 + 48 = 161 bytes
 """
 
 import socket
@@ -165,25 +159,20 @@ class UR5IKServer:
 
         try:
             while True:
-                # Read command type (1 byte)
-                try:
-                    cmd_data = client_socket.recv(1)
-                    if not cmd_data or len(cmd_data) == 0:
-                        print("Client disconnected (no data)")
-                        break
-                except socket.timeout:
-                    print("Socket timeout, client may have disconnected")
-                    break
-
                 # Read data: 3d + 4d + 6d = 13 doubles = 104 bytes
                 data = b''
                 remaining = 104
-                while remaining > 0:
-                    chunk = client_socket.recv(remaining)
-                    if not chunk:
-                        break
-                    data += chunk
-                    remaining -= len(chunk)
+                try:
+                    while remaining > 0:
+                        chunk = client_socket.recv(remaining)
+                        if not chunk:
+                            print("Client disconnected (no data)")
+                            return
+                        data += chunk
+                        remaining -= len(chunk)
+                except socket.timeout:
+                    print("Socket timeout, client may have disconnected")
+                    break
 
                 if len(data) != 104:
                     print(

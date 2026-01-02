@@ -85,7 +85,12 @@ public class UR5Controller : MonoBehaviour
     /// </summary>
     public void MoveToTarget(Vector3 targetPosition, Quaternion targetRotation)
     {
-        float[] targetAngles = ikSolver.SolveIK(targetPosition, targetRotation, GetJointAngles());
+        (Vector3 relativePosition, Quaternion relativeRotation) = ConvertToRobotCoordinates(targetPosition, targetRotation);
+        float[] currentAngles = GetJointAngles();
+        float[] targetAngles = ikSolver.SolveIK(relativePosition, relativeRotation, currentAngles);
+
+        Debug.Log($"UR5Controller: Current angles: [{string.Join(", ", currentAngles)}]");
+        Debug.Log($"UR5Controller: Target angles: [{string.Join(", ", targetAngles ?? new float[0])}]");
 
         if (targetAngles != null)
         {
@@ -104,37 +109,9 @@ public class UR5Controller : MonoBehaviour
     /// <summary>
     /// Apply delta action from VLA model
     /// </summary>
-    public void ApplyDeltaAction(float[] deltaAction)
+    public void ApplyDeltaAction(Vector3 deltaPosition, Quaternion deltaRotation)
     {
-        // deltaAction = [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, gripper]
-        if (deltaAction.Length < 7)
-        {
-            Debug.LogError("Delta action must have 7 elements");
-            return;
-        }
-
-        // Get current end effector pose
-        Vector3 currentPos = endEffector.position;
-        Quaternion currentRot = endEffector.rotation;
-
-        float[] targetAngles = ikSolver.SolveIKDelta(currentPos, currentRot, deltaAction, GetJointAngles());
-
-        if (targetAngles != null)
-        {
-            if (moveCoroutine != null)
-            {
-                StopCoroutine(moveCoroutine);
-            }
-            moveCoroutine = StartCoroutine(MoveToAnglesCoroutine(targetAngles));
-        }
-        else
-        {
-            Debug.LogWarning("UR5Controller: No IK solution found for delta action");
-        }
-
-        // Control gripper/suction
-        float gripperCmd = deltaAction[6];
-        SetGripper(gripperCmd > 0.5f);
+        MoveToTarget(endEffector.position + deltaPosition, endEffector.rotation * deltaRotation);
     }
 
     public void MoveToAngles(float[] targetAngles)
@@ -158,6 +135,7 @@ public class UR5Controller : MonoBehaviour
                 ArticulationDrive drive = robotJoints[i].xDrive;
                 drive.target = angles[i] * Mathf.Rad2Deg;
                 robotJoints[i].xDrive = drive;
+                Debug.Log($"Joint {i}: Setting target to {drive.target} degrees ({angles[i]} radians)");
             }
         }
     }
@@ -187,6 +165,13 @@ public class UR5Controller : MonoBehaviour
         SetJointAngles(targetAngles);
     }
 
+    private (Vector3 position, Quaternion rotation) ConvertToRobotCoordinates(Vector3 inputPosition, Quaternion inputRotation)
+    {
+        Vector3 position = originTransform.InverseTransformPoint(inputPosition);
+        Quaternion rotation = Quaternion.Inverse(originTransform.rotation) * inputRotation;
+        return (position, rotation);
+    }
+
     /// <summary>
     /// Control gripper/suction
     /// </summary>
@@ -209,9 +194,7 @@ public class UR5Controller : MonoBehaviour
     {
         if (endEffector != null)
         {
-            Vector3 position = originTransform.InverseTransformPoint(endEffector.position);
-            Quaternion rotation = Quaternion.Inverse(originTransform.rotation) * endEffector.rotation;
-            return (position, rotation);
+            return ConvertToRobotCoordinates(endEffector.position, endEffector.rotation);
         }
         else
         {

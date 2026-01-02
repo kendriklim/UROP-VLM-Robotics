@@ -2,29 +2,39 @@ using UnityEngine;
 using System;
 using System.Net.Sockets;
 using System.IO;
+using System.Threading.Tasks;
 
 /// <summary>
-/// IK Solver for UR5 robot using Python roboticstoolbox via TCP connection
-/// Connects to a Python server that performs IK calculations using rtb library
+/// IK Solver for UR5 robot using Python roboticstoolbox via TCP connection.
+/// Connects to a Python server that performs IK calculations using rtb library.
+///
+/// Protocol:
+///   Client sends: 104 bytes [target_pos(3d) + target_rot(4d) + current_angles(6d)]
+///   Server responds: 1 byte success flag + 48 bytes joint angles (if success)
 /// </summary>
 public class UR5IKSolver : MonoBehaviour
 {
     [Header("Python IK Server Settings")]
+    [SerializeField]
     [Tooltip("Python IK server host address")]
-    public string serverHost = "127.0.0.1";
+    private string serverHost = "127.0.0.1";
 
+    [SerializeField]
     [Tooltip("Python IK server port")]
-    public int serverPort = 5010;
+    private int serverPort = 5010;
 
+    [SerializeField]
     [Tooltip("Enable auto-reconnect on connection failure")]
-    public bool autoReconnect = true;
+    private bool autoReconnect = true;
 
+    [SerializeField]
     [Tooltip("Connection timeout in milliseconds")]
-    public int connectionTimeout = 5000;
+    private int connectionTimeout = 2000;
 
-    [Header("Debug")]
-    [Tooltip("Enable detailed logging")]
-    public bool debugMode = false;
+    // [Header("Debug")]
+    // [SerializeField]
+    // [Tooltip("Enable detailed logging")]
+    private bool debugMode = true;
 
     // TCP client for communication with Python server
     private TcpClient client;
@@ -32,14 +42,13 @@ public class UR5IKSolver : MonoBehaviour
     private BinaryWriter writer;
     private BinaryReader reader;
     private bool isConnected = false;
-
-    // Command types
-    private const byte CMD_SOLVE_IK = 1;
-    private const byte CMD_SOLVE_IK_DELTA = 2;
+    private bool isConnecting = false;
+    private Task connectionTask = null;
 
     void Start()
     {
-        ConnectToServer();
+        // Don't connect on startup - connect lazily on first use
+        Debug.Log("UR5IKSolver: Initialized. Will connect on first IK request.");
     }
 
     void OnDestroy()
@@ -83,7 +92,7 @@ public class UR5IKSolver : MonoBehaviour
             reader = new BinaryReader(stream);
 
             isConnected = true;
-            Debug.Log("UR5IKSolver: Connected to Python IK server successfully");
+            Debug.Log($"UR5IKSolver: Connected to Python IK server at {serverHost}:{serverPort} successfully!");
             return true;
         }
         catch (Exception e)
@@ -116,20 +125,42 @@ public class UR5IKSolver : MonoBehaviour
     }
 
     /// <summary>
-    /// Ensure connection to server, reconnect if necessary
+    /// Ensure connection to server, start connection if needed
+    /// Returns true if connected, false if connecting or failed
     /// </summary>
     private bool EnsureConnection()
     {
+        // Already connected
         if (isConnected && client != null && client.Connected)
         {
             return true;
         }
 
-        if (autoReconnect)
+        // Currently connecting - don't block, just return false
+        if (isConnecting)
         {
-            Debug.LogWarning("UR5IKSolver: Connection lost, attempting to reconnect...");
-            DisconnectFromServer();
-            return ConnectToServer();
+            return false;
+        }
+
+        // Not connected and not connecting - start async connection
+        if (autoReconnect || connectionTask == null)
+        {
+            isConnecting = true;
+            connectionTask = Task.Run(() =>
+            {
+                try
+                {
+                    bool success = ConnectToServer();
+                    isConnecting = false;
+                    return success;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"UR5IKSolver: Async connection failed: {e.Message}");
+                    isConnecting = false;
+                    return false;
+                }
+            });
         }
 
         return false;
@@ -144,8 +175,6 @@ public class UR5IKSolver : MonoBehaviour
     /// <returns>Target joint angles in radians, or null if no solution found</returns>
     public float[] SolveIK(Vector3 targetPosition, Quaternion targetRotation, float[] currentAngles)
     {
-        print("solving ik for target position");
-        print($"Target: ({targetPosition.x:F6}, {targetPosition.y:F6}, {targetPosition.z:F6})");
         if (currentAngles == null || currentAngles.Length != 6)
         {
             Debug.LogError("UR5IKSolver.SolveIK: currentAngles must be an array of 6 floats");
@@ -154,7 +183,11 @@ public class UR5IKSolver : MonoBehaviour
 
         if (!EnsureConnection())
         {
-            Debug.LogError("UR5IKSolver.SolveIK: Not connected to Python server");
+            // Not connected yet - return current angles and connection will retry
+            if (debugMode && !isConnecting)
+            {
+                Debug.LogWarning("UR5IKSolver.SolveIK: Not connected to Python server");
+            }
             return currentAngles; // Return current angles as fallback
         }
 
@@ -164,9 +197,6 @@ public class UR5IKSolver : MonoBehaviour
             {
                 Debug.Log($"UR5IKSolver.SolveIK: Sending request - pos={targetPosition}, rot={targetRotation}");
             }
-
-            // Send command type
-            writer.Write(CMD_SOLVE_IK);
 
             // Send target position (3 doubles)
             writer.Write((double)targetPosition.x);
@@ -210,15 +240,8 @@ public class UR5IKSolver : MonoBehaviour
 
             if (success == 1)
             {
-                // Wait for full response data
-                elapsed = 0;
-                while (stream.DataAvailable && stream.Length < 48 && elapsed < timeout)
-                {
-                    System.Threading.Thread.Sleep(sleepInterval);
-                    elapsed += sleepInterval;
-                }
-
                 // Read 6 joint angles (6 doubles = 48 bytes)
+                // BinaryReader will block until data is available
                 float[] solution = new float[6];
                 for (int i = 0; i < 6; i++)
                 {
